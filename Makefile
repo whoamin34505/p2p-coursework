@@ -1,11 +1,15 @@
-CXX = g++
-CXXFLAGS = -Wall -Wextra -std=c++17
+CC = gcc
+CFLAGS = -Wall -Wextra -std=c11
 TARGET = p2p_node
 
-SRC = src/main.cpp src/network.cpp src/crypto.cpp src/logger.cpp
+SRC = src/main.c src/network.c src/crypto.c src/logger.c
 
-all:
-	$(CXX) $(CXXFLAGS) $(SRC) -o $(TARGET)
+LIBS = -pthread -lcrypto
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) $(SRC) -o $(TARGET) $(LIBS)
 
 clean:
 	rm -f $(TARGET)
