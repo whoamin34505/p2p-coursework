@@ -290,6 +290,7 @@ static void handle_get_command(int client_socket, const char *filename) {
     char source_path[MAX_PATH_LENGTH];
     char encrypted_path[MAX_PATH_LENGTH];
     char header[COMMAND_SIZE];
+    char file_hash[SHA256_HEX_LENGTH];
     long encrypted_size;
 
     if (!is_valid_filename(filename)) {
@@ -307,6 +308,14 @@ static void handle_get_command(int client_socket, const char *filename) {
     }
 
     build_shared_path(source_path, sizeof(source_path), filename);
+
+    if (calculate_file_sha256(source_path, file_hash, sizeof(file_hash)) != 0) {
+        snprintf(header, sizeof(header), "ERROR hash calculation failed\n");
+        send_all(client_socket, header, strlen(header));
+        log_message("ERROR", "Cannot calculate SHA-256 for file: %s", filename);
+        return;
+    }
+
     snprintf(encrypted_path, sizeof(encrypted_path), "/tmp/p2p_%ld_%d_%s.enc",
              (long)time(NULL), getpid(), filename);
 
@@ -326,7 +335,7 @@ static void handle_get_command(int client_socket, const char *filename) {
         return;
     }
 
-    snprintf(header, sizeof(header), "FILE %s %ld\n", filename, encrypted_size);
+    snprintf(header, sizeof(header), "FILE %s %ld %s\n", filename, encrypted_size, file_hash);
 
     if (send_all(client_socket, header, strlen(header)) < 0) {
         remove(encrypted_path);
@@ -531,6 +540,8 @@ int download_file_from_network(const char *filename, Peer peers[], int peer_coun
     char header[COMMAND_SIZE];
     char header_name[64];
     char header_filename[MAX_FILENAME_LENGTH];
+    char expected_hash[SHA256_HEX_LENGTH];
+    char actual_hash[SHA256_HEX_LENGTH];
     long encrypted_size;
 
     char encrypted_path[MAX_PATH_LENGTH];
@@ -564,16 +575,21 @@ int download_file_from_network(const char *filename, Peer peers[], int peer_coun
 
     memset(header_name, 0, sizeof(header_name));
     memset(header_filename, 0, sizeof(header_filename));
+    memset(expected_hash, 0, sizeof(expected_hash));
+    memset(actual_hash, 0, sizeof(actual_hash));
     encrypted_size = 0;
 
-    if (sscanf(header, "%63s %255s %ld", header_name, header_filename, &encrypted_size) != 3) {
+    if (sscanf(header, "%63s %255s %ld %64s",
+               header_name, header_filename, &encrypted_size, expected_hash) != 4) {
         close(socket_fd);
         printf("Bad response from peer: %s\n", header);
         log_message("ERROR", "Bad FILE header: %s", header);
         return -1;
     }
 
-    if (strcmp(header_name, "FILE") != 0 || encrypted_size <= 0) {
+    if (strcmp(header_name, "FILE") != 0 ||
+        encrypted_size <= 0 ||
+        strcmp(header_filename, filename) != 0) {
         close(socket_fd);
         printf("Peer returned error: %s\n", header);
         log_message("ERROR", "Peer returned error: %s", header);
@@ -598,10 +614,28 @@ int download_file_from_network(const char *filename, Peer peers[], int peer_coun
         return -1;
     }
 
+    if (calculate_file_sha256(output_path, actual_hash, sizeof(actual_hash)) != 0) {
+        remove(encrypted_path);
+        remove(output_path);
+        log_message("ERROR", "Cannot calculate SHA-256 for received file: %s", filename);
+        return -1;
+    }
+
+    if (strcmp(expected_hash, actual_hash) != 0) {
+        remove(encrypted_path);
+        remove(output_path);
+        printf("File integrity check failed: %s\n", filename);
+        log_message("ERROR", "File integrity check failed: %s", filename);
+        return -1;
+    }
+
     remove(encrypted_path);
 
     printf("File downloaded successfully: downloads/%s\n", filename);
+    printf("File integrity check passed\n");
+
     log_message("INFO", "File downloaded successfully: %s from %s", filename, source_peer.name);
+    log_message("INFO", "File integrity check passed: %s", filename);
 
     return 0;
 }
