@@ -1,0 +1,7 @@
+p2p_node
+*.o
+node.log
+downloads/*
+!downloads/.gitkeep
+shared/*
+!shared/.gitkeep
