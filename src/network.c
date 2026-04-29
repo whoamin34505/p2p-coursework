@@ -5,18 +5,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <ctype.h>
-#include <time.h>
+#include <unistd.h>
 #include <errno.h>
+#include <time.h>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define BUFFER_SIZE 4096
-#define COMMAND_SIZE 512
+#define COMMAND_SIZE 1024
+#define DISCOVERY_BROADCAST_IP "255.255.255.255"
 
 static int is_valid_filename(const char *filename) {
     size_t i;
@@ -27,11 +27,8 @@ static int is_valid_filename(const char *filename) {
     }
 
     length = strlen(filename);
-    if (length == 0 || length >= MAX_FILENAME_LENGTH) {
-        return 0;
-    }
 
-    if (strstr(filename, "..") != NULL) {
+    if (length == 0 || length >= MAX_FILENAME_LENGTH) {
         return 0;
     }
 
@@ -97,26 +94,31 @@ static int recv_all(int socket_fd, void *buffer, size_t size) {
 
 static int receive_line(int socket_fd, char *buffer, size_t size) {
     size_t index;
-    char character;
+    char ch;
     ssize_t received;
+
+    if (size == 0) {
+        return -1;
+    }
 
     index = 0;
 
     while (index < size - 1) {
-        received = recv(socket_fd, &character, 1, 0);
+        received = recv(socket_fd, &ch, 1, 0);
         if (received <= 0) {
             return -1;
         }
 
-        if (character == '\n') {
+        if (ch == '\n') {
             break;
         }
 
-        buffer[index] = character;
+        buffer[index] = ch;
         index++;
     }
 
     buffer[index] = '\0';
+
     return 0;
 }
 
@@ -129,7 +131,11 @@ static long get_file_size(const char *path) {
         return -1;
     }
 
-    fseek(file, 0, SEEK_END);
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        return -1;
+    }
+
     size = ftell(file);
     fclose(file);
 
@@ -162,7 +168,7 @@ static int send_raw_file(int socket_fd, const char *path) {
     }
 
     while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
-        if (send_all(socket_fd, buffer, bytes_read) < 0) {
+        if (send_all(socket_fd, buffer, bytes_read) != 0) {
             fclose(file);
             return -1;
         }
@@ -175,30 +181,34 @@ static int send_raw_file(int socket_fd, const char *path) {
 static int receive_raw_file(int socket_fd, const char *path, long file_size) {
     FILE *file;
     char buffer[BUFFER_SIZE];
-    long received_total;
-    size_t bytes_to_receive;
+    long remaining;
+    size_t chunk_size;
 
     file = fopen(path, "wb");
     if (file == NULL) {
         return -1;
     }
 
-    received_total = 0;
+    remaining = file_size;
 
-    while (received_total < file_size) {
-        bytes_to_receive = BUFFER_SIZE;
-
-        if (file_size - received_total < BUFFER_SIZE) {
-            bytes_to_receive = (size_t)(file_size - received_total);
+    while (remaining > 0) {
+        if (remaining > BUFFER_SIZE) {
+            chunk_size = BUFFER_SIZE;
+        } else {
+            chunk_size = (size_t)remaining;
         }
 
-        if (recv_all(socket_fd, buffer, bytes_to_receive) < 0) {
+        if (recv_all(socket_fd, buffer, chunk_size) != 0) {
             fclose(file);
             return -1;
         }
 
-        fwrite(buffer, 1, bytes_to_receive, file);
-        received_total += (long)bytes_to_receive;
+        if (fwrite(buffer, 1, chunk_size, file) != chunk_size) {
+            fclose(file);
+            return -1;
+        }
+
+        remaining -= (long)chunk_size;
     }
 
     fclose(file);
@@ -212,7 +222,7 @@ static int create_server_socket(int port) {
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
-        log_message("ERROR", "socket failed: %s", strerror(errno));
+        log_message("ERROR", "socket failed");
         return -1;
     }
 
@@ -225,13 +235,13 @@ static int create_server_socket(int port) {
     address.sin_port = htons((unsigned short)port);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        log_message("ERROR", "bind failed: %s", strerror(errno));
+        log_message("ERROR", "bind failed");
         close(server_fd);
         return -1;
     }
 
     if (listen(server_fd, 10) < 0) {
-        log_message("ERROR", "listen failed: %s", strerror(errno));
+        log_message("ERROR", "listen failed");
         close(server_fd);
         return -1;
     }
@@ -265,6 +275,202 @@ static int connect_to_peer(const char *ip, int port) {
     return socket_fd;
 }
 
+static int peer_already_exists(Peer peers[], int peer_count, const char *name, const char *ip, int port) {
+    int i;
+
+    for (i = 0; i < peer_count; i++) {
+        if (strcmp(peers[i].name, name) == 0 ||
+            (strcmp(peers[i].ip, ip) == 0 && peers[i].port == port)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+void *discovery_listener_thread(void *arg) {
+    DiscoveryArgs *discovery_args;
+    int socket_fd;
+    int option;
+    struct sockaddr_in address;
+    struct sockaddr_in sender_address;
+    socklen_t sender_length;
+
+    char buffer[COMMAND_SIZE];
+    char command[64];
+    char sender_name[MAX_NAME_LENGTH];
+    char response[COMMAND_SIZE];
+
+    int sender_tcp_port;
+    ssize_t received;
+
+    discovery_args = (DiscoveryArgs *)arg;
+
+    socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_fd < 0) {
+        log_message("ERROR", "Cannot create UDP discovery socket");
+        return NULL;
+    }
+
+    option = 1;
+    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(DISCOVERY_PORT);
+
+    if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        log_message("ERROR", "Cannot bind UDP discovery socket");
+        close(socket_fd);
+        return NULL;
+    }
+
+    log_message("INFO", "Discovery listener started on UDP port %d", DISCOVERY_PORT);
+
+    while (1) {
+        memset(buffer, 0, sizeof(buffer));
+        memset(&sender_address, 0, sizeof(sender_address));
+        sender_length = sizeof(sender_address);
+
+        received = recvfrom(socket_fd, buffer, sizeof(buffer) - 1, 0,
+                            (struct sockaddr *)&sender_address, &sender_length);
+
+        if (received <= 0) {
+            continue;
+        }
+
+        buffer[received] = '\0';
+
+        memset(command, 0, sizeof(command));
+        memset(sender_name, 0, sizeof(sender_name));
+        sender_tcp_port = 0;
+
+        if (sscanf(buffer, "%63s %31s %d", command, sender_name, &sender_tcp_port) != 3) {
+            continue;
+        }
+
+        if (strcmp(command, "DISCOVER_P2P") != 0) {
+            continue;
+        }
+
+        if (strcmp(sender_name, discovery_args->node_name) == 0) {
+            continue;
+        }
+
+        snprintf(response, sizeof(response), "PEER %s %d\n",
+                 discovery_args->node_name, discovery_args->tcp_port);
+
+        sendto(socket_fd, response, strlen(response), 0,
+               (struct sockaddr *)&sender_address, sender_length);
+    }
+
+    close(socket_fd);
+    return NULL;
+}
+
+int discover_peers(const char *current_node_name, int current_port, Peer peers[], int max_peers) {
+    int socket_fd;
+    int option;
+    int peer_count;
+
+    struct sockaddr_in broadcast_address;
+    struct sockaddr_in sender_address;
+    socklen_t sender_length;
+    struct timeval timeout;
+
+    char message[COMMAND_SIZE];
+    char buffer[COMMAND_SIZE];
+    char command[64];
+    char peer_name[MAX_NAME_LENGTH];
+    char peer_ip[MAX_IP_LENGTH];
+
+    int peer_port;
+    ssize_t received;
+
+    socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_fd < 0) {
+        log_message("ERROR", "Cannot create UDP discovery sender socket");
+        return 0;
+    }
+
+    option = 1;
+    setsockopt(socket_fd, SOL_SOCKET, SO_BROADCAST, &option, sizeof(option));
+
+    timeout.tv_sec = DISCOVERY_TIMEOUT_SECONDS;
+    timeout.tv_usec = 0;
+    setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    memset(&broadcast_address, 0, sizeof(broadcast_address));
+    broadcast_address.sin_family = AF_INET;
+    broadcast_address.sin_port = htons(DISCOVERY_PORT);
+    broadcast_address.sin_addr.s_addr = inet_addr(DISCOVERY_BROADCAST_IP);
+
+    snprintf(message, sizeof(message), "DISCOVER_P2P %s %d\n",
+             current_node_name, current_port);
+
+    if (sendto(socket_fd, message, strlen(message), 0,
+               (struct sockaddr *)&broadcast_address, sizeof(broadcast_address)) < 0) {
+        log_message("ERROR", "Cannot send discovery broadcast");
+        close(socket_fd);
+        return 0;
+    }
+
+    log_message("INFO", "Discovery broadcast sent");
+    peer_count = 0;
+
+    while (peer_count < max_peers) {
+        memset(buffer, 0, sizeof(buffer));
+        memset(&sender_address, 0, sizeof(sender_address));
+        sender_length = sizeof(sender_address);
+
+        received = recvfrom(socket_fd, buffer, sizeof(buffer) - 1, 0,
+                            (struct sockaddr *)&sender_address, &sender_length);
+
+        if (received <= 0) {
+            break;
+        }
+
+        buffer[received] = '\0';
+
+        memset(command, 0, sizeof(command));
+        memset(peer_name, 0, sizeof(peer_name));
+        peer_port = 0;
+
+        if (sscanf(buffer, "%63s %31s %d", command, peer_name, &peer_port) != 3) {
+            continue;
+        }
+
+        if (strcmp(command, "PEER") != 0) {
+            continue;
+        }
+
+        if (strcmp(peer_name, current_node_name) == 0) {
+            continue;
+        }
+
+        snprintf(peer_ip, sizeof(peer_ip), "%s", inet_ntoa(sender_address.sin_addr));
+
+        if (peer_already_exists(peers, peer_count, peer_name, peer_ip, peer_port)) {
+            continue;
+        }
+
+        snprintf(peers[peer_count].name, sizeof(peers[peer_count].name), "%s", peer_name);
+        snprintf(peers[peer_count].ip, sizeof(peers[peer_count].ip), "%s", peer_ip);
+        peers[peer_count].port = peer_port;
+
+        log_message("INFO", "Discovered peer: %s %s:%d",
+                    peers[peer_count].name,
+                    peers[peer_count].ip,
+                    peers[peer_count].port);
+
+        peer_count++;
+    }
+
+    close(socket_fd);
+    return peer_count;
+}
+
 static void handle_find_command(int client_socket, const char *filename) {
     char response[COMMAND_SIZE];
 
@@ -277,13 +483,13 @@ static void handle_find_command(int client_socket, const char *filename) {
 
     if (file_exists_in_shared(filename)) {
         snprintf(response, sizeof(response), "FOUND %s\n", filename);
-        send_all(client_socket, response, strlen(response));
         log_message("INFO", "File found for remote peer: %s", filename);
     } else {
         snprintf(response, sizeof(response), "NOTFOUND %s\n", filename);
-        send_all(client_socket, response, strlen(response));
         log_message("INFO", "File not found for remote peer: %s", filename);
     }
+
+    send_all(client_socket, response, strlen(response));
 }
 
 static void handle_get_command(int client_socket, const char *filename) {
@@ -291,6 +497,7 @@ static void handle_get_command(int client_socket, const char *filename) {
     char encrypted_path[MAX_PATH_LENGTH];
     char header[COMMAND_SIZE];
     char file_hash[SHA256_HEX_LENGTH];
+
     long encrypted_size;
 
     if (!is_valid_filename(filename)) {
@@ -337,7 +544,7 @@ static void handle_get_command(int client_socket, const char *filename) {
 
     snprintf(header, sizeof(header), "FILE %s %ld %s\n", filename, encrypted_size, file_hash);
 
-    if (send_all(client_socket, header, strlen(header)) < 0) {
+    if (send_all(client_socket, header, strlen(header)) != 0) {
         remove(encrypted_path);
         log_message("ERROR", "Cannot send FILE header");
         return;
@@ -354,63 +561,59 @@ static void handle_get_command(int client_socket, const char *filename) {
 }
 
 static void handle_client(int client_socket) {
-    char command[COMMAND_SIZE];
+    char command_line[COMMAND_SIZE];
     char command_name[64];
     char filename[MAX_FILENAME_LENGTH];
+    char response[COMMAND_SIZE];
 
-    memset(command, 0, sizeof(command));
+    if (receive_line(client_socket, command_line, sizeof(command_line)) != 0) {
+        log_message("ERROR", "Cannot receive command from client");
+        return;
+    }
+
     memset(command_name, 0, sizeof(command_name));
     memset(filename, 0, sizeof(filename));
 
-    if (receive_line(client_socket, command, sizeof(command)) != 0) {
-        log_message("ERROR", "Cannot receive command from peer");
-        return;
-    }
-
-    log_message("INFO", "Received command: %s", command);
-
-    if (sscanf(command, "%63s %255s", command_name, filename) < 1) {
-        send_all(client_socket, "ERROR bad command\n", strlen("ERROR bad command\n"));
-        return;
-    }
+    sscanf(command_line, "%63s %255s", command_name, filename);
 
     if (strcmp(command_name, "HELLO") == 0) {
-        send_all(client_socket, "OK\n", strlen("OK\n"));
-        log_message("INFO", "HELLO request processed");
+        snprintf(response, sizeof(response), "OK\n");
+        send_all(client_socket, response, strlen(response));
     } else if (strcmp(command_name, "FIND") == 0) {
         handle_find_command(client_socket, filename);
     } else if (strcmp(command_name, "GET") == 0) {
         handle_get_command(client_socket, filename);
     } else {
-        send_all(client_socket, "ERROR unknown command\n", strlen("ERROR unknown command\n"));
-        log_message("ERROR", "Unknown command: %s", command_name);
+        snprintf(response, sizeof(response), "ERROR unknown command\n");
+        send_all(client_socket, response, strlen(response));
+        log_message("ERROR", "Unknown command received: %s", command_line);
     }
 }
 
 void *server_thread(void *arg) {
     ServerArgs *server_args;
-    int server_socket;
+    int server_fd;
     int client_socket;
+
     struct sockaddr_in client_address;
     socklen_t client_length;
 
     server_args = (ServerArgs *)arg;
 
-    server_socket = create_server_socket(server_args->port);
-    if (server_socket < 0) {
-        log_message("ERROR", "Server was not started");
+    server_fd = create_server_socket(server_args->port);
+    if (server_fd < 0) {
+        log_message("ERROR", "Cannot start server socket");
         return NULL;
     }
 
-    log_message("INFO", "Node %s started on port %d", server_args->node_name, server_args->port);
-    printf("Server started on port %d\n", server_args->port);
+    log_message("INFO", "TCP server started on port %d", server_args->port);
 
     while (1) {
         client_length = sizeof(client_address);
-        client_socket = accept(server_socket, (struct sockaddr *)&client_address, &client_length);
+        client_socket = accept(server_fd, (struct sockaddr *)&client_address, &client_length);
 
         if (client_socket < 0) {
-            log_message("ERROR", "accept failed: %s", strerror(errno));
+            log_message("ERROR", "accept failed");
             continue;
         }
 
@@ -418,84 +621,48 @@ void *server_thread(void *arg) {
         close(client_socket);
     }
 
-    close(server_socket);
+    close(server_fd);
     return NULL;
-}
-
-int load_peers(const char *filename, const char *current_node_name, Peer peers[], int max_peers) {
-    FILE *file;
-    char name[MAX_NAME_LENGTH];
-    char ip[MAX_IP_LENGTH];
-    int port;
-    int count;
-
-    file = fopen(filename, "r");
-    if (file == NULL) {
-        log_message("ERROR", "Cannot open peers file: %s", filename);
-        return -1;
-    }
-
-    count = 0;
-
-    while (fscanf(file, "%31s %63s %d", name, ip, &port) == 3) {
-        if (strcmp(name, current_node_name) == 0) {
-            continue;
-        }
-
-        if (count >= max_peers) {
-            break;
-        }
-
-        strncpy(peers[count].name, name, MAX_NAME_LENGTH - 1);
-        peers[count].name[MAX_NAME_LENGTH - 1] = '\0';
-
-        strncpy(peers[count].ip, ip, MAX_IP_LENGTH - 1);
-        peers[count].ip[MAX_IP_LENGTH - 1] = '\0';
-
-        peers[count].port = port;
-        count++;
-    }
-
-    fclose(file);
-
-    log_message("INFO", "Loaded %d peers from %s", count, filename);
-    return count;
 }
 
 void print_peers(Peer peers[], int peer_count) {
     int i;
 
     if (peer_count == 0) {
-        printf("No peers loaded\n");
+        printf("No discovered peers\n");
         return;
     }
 
-    printf("Known peers:\n");
+    printf("Discovered peers:\n");
 
     for (i = 0; i < peer_count; i++) {
-        printf("%d. %s %s:%d\n", i + 1, peers[i].name, peers[i].ip, peers[i].port);
+        printf("%d. %s %s:%d\n",
+               i + 1,
+               peers[i].name,
+               peers[i].ip,
+               peers[i].port);
     }
 }
 
 int find_file_in_network(const char *filename, Peer peers[], int peer_count, Peer *found_peer) {
     int i;
     int socket_fd;
+
     char command[COMMAND_SIZE];
     char response[COMMAND_SIZE];
     char response_name[64];
-    char response_file[MAX_FILENAME_LENGTH];
+    char response_filename[MAX_FILENAME_LENGTH];
 
     if (!is_valid_filename(filename)) {
         printf("Invalid filename\n");
-        log_message("ERROR", "Invalid filename for FIND: %s", filename);
+        log_message("ERROR", "Invalid filename in find: %s", filename);
         return 0;
     }
 
     for (i = 0; i < peer_count; i++) {
         socket_fd = connect_to_peer(peers[i].ip, peers[i].port);
         if (socket_fd < 0) {
-            log_message("ERROR", "Peer unavailable: %s %s:%d",
-                        peers[i].name, peers[i].ip, peers[i].port);
+            log_message("ERROR", "Cannot connect to peer: %s", peers[i].name);
             continue;
         }
 
@@ -503,28 +670,29 @@ int find_file_in_network(const char *filename, Peer peers[], int peer_count, Pee
 
         if (send_all(socket_fd, command, strlen(command)) != 0) {
             close(socket_fd);
-            log_message("ERROR", "Cannot send FIND to %s", peers[i].name);
+            log_message("ERROR", "Cannot send FIND command to peer: %s", peers[i].name);
             continue;
         }
 
-        memset(response, 0, sizeof(response));
-
         if (receive_line(socket_fd, response, sizeof(response)) != 0) {
             close(socket_fd);
-            log_message("ERROR", "Cannot receive FIND response from %s", peers[i].name);
+            log_message("ERROR", "Cannot receive FIND response from peer: %s", peers[i].name);
             continue;
         }
 
         close(socket_fd);
 
         memset(response_name, 0, sizeof(response_name));
-        memset(response_file, 0, sizeof(response_file));
+        memset(response_filename, 0, sizeof(response_filename));
 
-        sscanf(response, "%63s %255s", response_name, response_file);
+        if (sscanf(response, "%63s %255s", response_name, response_filename) != 2) {
+            continue;
+        }
 
-        if (strcmp(response_name, "FOUND") == 0) {
+        if (strcmp(response_name, "FOUND") == 0 &&
+            strcmp(response_filename, filename) == 0) {
             *found_peer = peers[i];
-            log_message("INFO", "File %s found on peer %s", filename, peers[i].name);
+            log_message("INFO", "File found on peer: %s", peers[i].name);
             return 1;
         }
     }
@@ -536,12 +704,14 @@ int find_file_in_network(const char *filename, Peer peers[], int peer_count, Pee
 int download_file_from_network(const char *filename, Peer peers[], int peer_count) {
     Peer source_peer;
     int socket_fd;
+
     char command[COMMAND_SIZE];
     char header[COMMAND_SIZE];
     char header_name[64];
     char header_filename[MAX_FILENAME_LENGTH];
     char expected_hash[SHA256_HEX_LENGTH];
     char actual_hash[SHA256_HEX_LENGTH];
+
     long encrypted_size;
 
     char encrypted_path[MAX_PATH_LENGTH];
@@ -573,10 +743,18 @@ int download_file_from_network(const char *filename, Peer peers[], int peer_coun
         return -1;
     }
 
+    if (strncmp(header, "ERROR", 5) == 0) {
+        close(socket_fd);
+        printf("Peer returned error: %s\n", header);
+        log_message("ERROR", "Peer returned error: %s", header);
+        return -1;
+    }
+
     memset(header_name, 0, sizeof(header_name));
     memset(header_filename, 0, sizeof(header_filename));
     memset(expected_hash, 0, sizeof(expected_hash));
     memset(actual_hash, 0, sizeof(actual_hash));
+
     encrypted_size = 0;
 
     if (sscanf(header, "%63s %255s %ld %64s",
@@ -591,8 +769,8 @@ int download_file_from_network(const char *filename, Peer peers[], int peer_coun
         encrypted_size <= 0 ||
         strcmp(header_filename, filename) != 0) {
         close(socket_fd);
-        printf("Peer returned error: %s\n", header);
-        log_message("ERROR", "Peer returned error: %s", header);
+        printf("Bad FILE header: %s\n", header);
+        log_message("ERROR", "Bad FILE header: %s", header);
         return -1;
     }
 

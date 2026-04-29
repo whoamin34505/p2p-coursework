@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 static void create_directory_if_needed(const char *path) {
     struct stat st;
@@ -19,7 +20,8 @@ static void create_directory_if_needed(const char *path) {
 static void print_help(void) {
     printf("\nAvailable commands:\n");
     printf("  help                 show this help\n");
-    printf("  peers                show known peers\n");
+    printf("  discover             search peers by UDP broadcast\n");
+    printf("  peers                show discovered peers\n");
     printf("  find <filename>      search file in P2P network\n");
     printf("  get <filename>       download file from P2P network\n");
     printf("  exit                 stop node\n\n");
@@ -35,91 +37,101 @@ static void remove_newline(char *text) {
 }
 
 int main(int argc, char *argv[]) {
-    char node_name[MAX_NAME_LENGTH];
-    int port;
-    char peers_file[MAX_PATH_LENGTH];
+    NodeConfig config;
+    ServerArgs server_args;
+    DiscoveryArgs discovery_args;
+
+    pthread_t server_tid;
+    pthread_t discovery_tid;
 
     Peer peers[MAX_PEERS];
     int peer_count;
 
-    ServerArgs server_args;
-    pthread_t thread_id;
-
-    char input[512];
-    char command[64];
+    char command[512];
     char filename[MAX_FILENAME_LENGTH];
 
-    Peer found_peer;
-
-    if (argc != 4) {
-        printf("Usage: %s <node_name> <port> <peers_file>\n", argv[0]);
-        printf("Example: %s node1 5000 peers.conf\n", argv[0]);
+    if (argc != 3) {
+        printf("Usage: %s <node_name> <port>\n", argv[0]);
+        printf("Example: %s node1 5000\n", argv[0]);
         return 1;
     }
 
-    strncpy(node_name, argv[1], MAX_NAME_LENGTH - 1);
-    node_name[MAX_NAME_LENGTH - 1] = '\0';
+    memset(&config, 0, sizeof(config));
+    memset(peers, 0, sizeof(peers));
 
-    port = atoi(argv[2]);
+    snprintf(config.node_name, sizeof(config.node_name), "%s", argv[1]);
+    config.port = atoi(argv[2]);
 
-    strncpy(peers_file, argv[3], MAX_PATH_LENGTH - 1);
-    peers_file[MAX_PATH_LENGTH - 1] = '\0';
+    if (config.port <= 0) {
+        printf("Invalid port\n");
+        return 1;
+    }
 
     create_directory_if_needed("shared");
     create_directory_if_needed("downloads");
 
-    log_message("INFO", "Starting node: %s", node_name);
+    log_message("INFO", "Starting node: %s", config.node_name);
 
-    peer_count = load_peers(peers_file, node_name, peers, MAX_PEERS);
-    if (peer_count < 0) {
-        printf("Cannot load peers from file: %s\n", peers_file);
-        return 1;
-    }
+    memset(&server_args, 0, sizeof(server_args));
+    snprintf(server_args.node_name, sizeof(server_args.node_name), "%s", config.node_name);
+    server_args.port = config.port;
 
-    strncpy(server_args.node_name, node_name, MAX_NAME_LENGTH - 1);
-    server_args.node_name[MAX_NAME_LENGTH - 1] = '\0';
-    server_args.port = port;
-
-    if (pthread_create(&thread_id, NULL, server_thread, &server_args) != 0) {
+    if (pthread_create(&server_tid, NULL, server_thread, &server_args) != 0) {
         printf("Cannot start server thread\n");
         log_message("ERROR", "Cannot start server thread");
         return 1;
     }
 
-    pthread_detach(thread_id);
+    pthread_detach(server_tid);
+
+    memset(&discovery_args, 0, sizeof(discovery_args));
+    snprintf(discovery_args.node_name, sizeof(discovery_args.node_name), "%s", config.node_name);
+    discovery_args.tcp_port = config.port;
+
+    if (pthread_create(&discovery_tid, NULL, discovery_listener_thread, &discovery_args) != 0) {
+        printf("Cannot start discovery thread\n");
+        log_message("ERROR", "Cannot start discovery thread");
+        return 1;
+    }
+
+    pthread_detach(discovery_tid);
+
+    sleep(1);
 
     printf("P2P node started\n");
-    printf("Node name: %s\n", node_name);
-    printf("Port: %d\n", port);
-    printf("Peers loaded: %d\n", peer_count);
+    printf("Node name: %s\n", config.node_name);
+    printf("TCP port: %d\n", config.port);
+    printf("Discovery UDP port: %d\n", DISCOVERY_PORT);
 
+    peer_count = discover_peers(config.node_name, config.port, peers, MAX_PEERS);
+
+    printf("Discovered peers: %d\n", peer_count);
     print_help();
 
     while (1) {
-        printf("%s> ", node_name);
+        printf("> ");
 
-        if (fgets(input, sizeof(input), stdin) == NULL) {
+        if (fgets(command, sizeof(command), stdin) == NULL) {
             break;
         }
 
-        remove_newline(input);
-
-        if (strlen(input) == 0) {
-            continue;
-        }
-
-        memset(command, 0, sizeof(command));
-        memset(filename, 0, sizeof(filename));
-
-        sscanf(input, "%63s %255s", command, filename);
+        remove_newline(command);
 
         if (strcmp(command, "help") == 0) {
             print_help();
+        } else if (strcmp(command, "discover") == 0) {
+            memset(peers, 0, sizeof(peers));
+            peer_count = discover_peers(config.node_name, config.port, peers, MAX_PEERS);
+            printf("Discovered peers: %d\n", peer_count);
         } else if (strcmp(command, "peers") == 0) {
             print_peers(peers, peer_count);
-        } else if (strcmp(command, "find") == 0) {
-            if (strlen(filename) == 0) {
-                printf("Usage: find <filename>\n");
+        } else if (sscanf(command, "find %255s", filename) == 1) {
+            Peer found_peer;
+
+            memset(&found_peer, 0, sizeof(found_peer));
+
+            if (peer_count == 0) {
+                printf("No peers found. Run discover command first.\n");
                 continue;
             }
 
@@ -129,19 +141,20 @@ int main(int argc, char *argv[]) {
             } else {
                 printf("File not found: %s\n", filename);
             }
-        } else if (strcmp(command, "get") == 0) {
-            if (strlen(filename) == 0) {
-                printf("Usage: get <filename>\n");
+        } else if (sscanf(command, "get %255s", filename) == 1) {
+            if (peer_count == 0) {
+                printf("No peers found. Run discover command first.\n");
                 continue;
             }
 
             download_file_from_network(filename, peers, peer_count);
         } else if (strcmp(command, "exit") == 0) {
-            log_message("INFO", "Node stopped: %s", node_name);
-            printf("Stopping node...\n");
+            log_message("INFO", "Stopping node: %s", config.node_name);
             break;
+        } else if (strlen(command) == 0) {
+            continue;
         } else {
-            printf("Unknown command. Type 'help' to see commands.\n");
+            printf("Unknown command. Type help.\n");
         }
     }
 
