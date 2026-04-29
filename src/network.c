@@ -352,23 +352,117 @@ void *discovery_listener_thread(void *arg) {
             continue;
         }
 
-        if (strcmp(command, "DISCOVER_P2P") != 0) {
-            continue;
-        }
-
-        if (strcmp(sender_name, discovery_args->node_name) == 0) {
-            continue;
-        }
-
-        snprintf(response, sizeof(response), "PEER %s %d\n",
+        //
+        if (strcmp(command, "CHECK_NAME") == 0) {
+    if (strcmp(sender_name, discovery_args->node_name) == 0) {
+        snprintf(response, sizeof(response), "NAME_EXISTS %s %d\n",
                  discovery_args->node_name, discovery_args->tcp_port);
 
         sendto(socket_fd, response, strlen(response), 0,
                (struct sockaddr *)&sender_address, sender_length);
+
+        log_message("INFO", "Node name check response sent: %s",
+                    discovery_args->node_name);
+    }
+
+    continue;
+}
+
+if (strcmp(command, "DISCOVER_P2P") == 0) {
+    if (strcmp(sender_name, discovery_args->node_name) == 0 &&
+        sender_tcp_port == discovery_args->tcp_port) {
+        continue;
+    }
+
+    snprintf(response, sizeof(response), "PEER %s %d\n",
+             discovery_args->node_name, discovery_args->tcp_port);
+
+    sendto(socket_fd, response, strlen(response), 0,
+           (struct sockaddr *)&sender_address, sender_length);
+
+    continue;
+}
     }
 
     close(socket_fd);
     return NULL;
+}
+
+int node_name_exists_in_network(const char *node_name) {
+    int socket_fd;
+    int option;
+
+    struct sockaddr_in sender_address;
+    socklen_t sender_length;
+    struct timeval timeout;
+
+    char message[COMMAND_SIZE];
+    char buffer[COMMAND_SIZE];
+    char command[64];
+    char found_name[MAX_NAME_LENGTH];
+
+    int found_port;
+    ssize_t received;
+
+    socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_fd < 0) {
+        log_message("ERROR", "Cannot create UDP socket for node name check");
+        return -1;
+    }
+
+    option = 1;
+
+    setsockopt(socket_fd, SOL_SOCKET, SO_BROADCAST, &option, sizeof(option));
+    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
+
+    timeout.tv_sec = DISCOVERY_TIMEOUT_SECONDS;
+    timeout.tv_usec = 0;
+
+    setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+    snprintf(message, sizeof(message), "CHECK_NAME %s 0\n", node_name);
+
+    if (send_discovery_to_all_interfaces(socket_fd, message) <= 0) {
+        log_message("ERROR", "Cannot send node name check broadcast");
+        close(socket_fd);
+        return -1;
+    }
+
+    while (1) {
+        memset(buffer, 0, sizeof(buffer));
+        memset(&sender_address, 0, sizeof(sender_address));
+
+        sender_length = sizeof(sender_address);
+
+        received = recvfrom(socket_fd, buffer, sizeof(buffer) - 1, 0,
+                            (struct sockaddr *)&sender_address,
+                            &sender_length);
+
+        if (received <= 0) {
+            break;
+        }
+
+        buffer[received] = '\0';
+
+        memset(command, 0, sizeof(command));
+        memset(found_name, 0, sizeof(found_name));
+        found_port = 0;
+
+        if (sscanf(buffer, "%63s %31s %d", command, found_name, &found_port) != 3) {
+            continue;
+        }
+
+        if (strcmp(command, "NAME_EXISTS") == 0 &&
+            strcmp(found_name, node_name) == 0) {
+            close(socket_fd);
+
+            log_message("ERROR", "Node name already exists in network: %s", node_name);
+            return 1;
+        }
+    }
+
+    close(socket_fd);
+    return 0;
 }
 
 static int send_discovery_to_all_interfaces(int socket_fd, const char *message) {

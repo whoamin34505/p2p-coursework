@@ -35,6 +35,7 @@ void *server_thread(void *arg);
 void *discovery_listener_thread(void *arg);
 
 int discover_peers(const char *current_node_name, int current_port, Peer peers[], int max_peers);
+int node_name_exists_in_network(const char *node_name);
 void print_peers(Peer peers[], int peer_count);
 
 int find_file_in_network(const char *filename, Peer peers[], int peer_count, Peer *found_peer);

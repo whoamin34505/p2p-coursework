@@ -86,6 +86,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    printf("Checking node name availability...\n");
+
+if (node_name_exists_in_network(config.node_name) == 1) {
+    printf("Node name already exists in network: %s\n", config.node_name);
+    printf("Please choose another node name.\n");
+    return 1;
+}
+
     create_directory_if_needed("shared");
     create_directory_if_needed("downloads");
 
