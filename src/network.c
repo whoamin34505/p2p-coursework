@@ -17,7 +17,7 @@
 
 #define BUFFER_SIZE 4096
 #define COMMAND_SIZE 1024
-#define DISCOVERY_BROADCAST_IP "255.255.255.255"
+#define DISCOVERY_BROADCAST_IP "192.168.56.255"
 
 static int is_valid_filename(const char *filename) {
     size_t i;
