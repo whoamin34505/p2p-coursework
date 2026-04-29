@@ -20,6 +20,8 @@
 #define BUFFER_SIZE 4096
 #define COMMAND_SIZE 1024
 
+static int send_discovery_to_all_interfaces(int socket_fd, const char *message);
+
 static int is_valid_filename(const char *filename) {
     size_t i;
     size_t length;
