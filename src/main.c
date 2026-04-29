@@ -20,7 +20,6 @@ static void create_directory_if_needed(const char *path) {
 static void print_help(void) {
     printf("\nAvailable commands:\n");
     printf("  help                 show this help\n");
-    printf("  discover             search peers by UDP broadcast\n");
     printf("  peers                show discovered peers\n");
     printf("  find <filename>      search file in P2P network\n");
     printf("  get <filename>       download file from P2P network\n");
@@ -31,9 +30,27 @@ static void remove_newline(char *text) {
     size_t length;
 
     length = strlen(text);
+
     if (length > 0 && text[length - 1] == '\n') {
         text[length - 1] = '\0';
     }
+}
+
+static void refresh_peers(const char *node_name, int port, Peer peers[], int *peer_count) {
+    Peer discovered[MAX_PEERS];
+    int new_count;
+
+    memset(discovered, 0, sizeof(discovered));
+
+    new_count = discover_peers(node_name, port, discovered, MAX_PEERS);
+
+    if (new_count > 0 || *peer_count == 0) {
+        memset(peers, 0, sizeof(Peer) * MAX_PEERS);
+        memcpy(peers, discovered, sizeof(Peer) * MAX_PEERS);
+        *peer_count = new_count;
+    }
+
+    printf("Discovered peers: %d\n", *peer_count);
 }
 
 int main(int argc, char *argv[]) {
@@ -58,6 +75,8 @@ int main(int argc, char *argv[]) {
 
     memset(&config, 0, sizeof(config));
     memset(peers, 0, sizeof(peers));
+
+    peer_count = 0;
 
     snprintf(config.node_name, sizeof(config.node_name), "%s", argv[1]);
     config.port = atoi(argv[2]);
@@ -103,9 +122,8 @@ int main(int argc, char *argv[]) {
     printf("TCP port: %d\n", config.port);
     printf("Discovery UDP port: %d\n", DISCOVERY_PORT);
 
-    peer_count = discover_peers(config.node_name, config.port, peers, MAX_PEERS);
+    refresh_peers(config.node_name, config.port, peers, &peer_count);
 
-    printf("Discovered peers: %d\n", peer_count);
     print_help();
 
     while (1) {
@@ -119,31 +137,34 @@ int main(int argc, char *argv[]) {
 
         if (strcmp(command, "help") == 0) {
             print_help();
-        } else if (strcmp(command, "discover") == 0) {
-            memset(peers, 0, sizeof(peers));
-            peer_count = discover_peers(config.node_name, config.port, peers, MAX_PEERS);
-            printf("Discovered peers: %d\n", peer_count);
         } else if (strcmp(command, "peers") == 0) {
+            refresh_peers(config.node_name, config.port, peers, &peer_count);
             print_peers(peers, peer_count);
         } else if (sscanf(command, "find %255s", filename) == 1) {
             Peer found_peer;
 
             memset(&found_peer, 0, sizeof(found_peer));
 
+            refresh_peers(config.node_name, config.port, peers, &peer_count);
+
             if (peer_count == 0) {
-                printf("No peers found. Run discover command first.\n");
+                printf("No peers found\n");
                 continue;
             }
 
             if (find_file_in_network(filename, peers, peer_count, &found_peer)) {
                 printf("File found on peer: %s %s:%d\n",
-                       found_peer.name, found_peer.ip, found_peer.port);
+                       found_peer.name,
+                       found_peer.ip,
+                       found_peer.port);
             } else {
                 printf("File not found: %s\n", filename);
             }
         } else if (sscanf(command, "get %255s", filename) == 1) {
+            refresh_peers(config.node_name, config.port, peers, &peer_count);
+
             if (peer_count == 0) {
-                printf("No peers found. Run discover command first.\n");
+                printf("No peers found\n");
                 continue;
             }
 

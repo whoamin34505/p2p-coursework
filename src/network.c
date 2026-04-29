@@ -14,10 +14,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 #define BUFFER_SIZE 4096
 #define COMMAND_SIZE 1024
-#define DISCOVERY_BROADCAST_IP "192.168.56.255"
 
 static int is_valid_filename(const char *filename) {
     size_t i;
@@ -370,12 +371,79 @@ void *discovery_listener_thread(void *arg) {
     return NULL;
 }
 
+static int send_discovery_to_all_interfaces(int socket_fd, const char *message) {
+    struct ifaddrs *interfaces;
+    struct ifaddrs *item;
+    struct sockaddr_in broadcast_address;
+    struct sockaddr_in fallback_address;
+
+    int sent_count;
+
+    sent_count = 0;
+
+    if (getifaddrs(&interfaces) != 0) {
+        log_message("ERROR", "Cannot get network interfaces");
+        return -1;
+    }
+
+    for (item = interfaces; item != NULL; item = item->ifa_next) {
+        if (item->ifa_addr == NULL || item->ifa_broadaddr == NULL) {
+            continue;
+        }
+
+        if (item->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+
+        if (!(item->ifa_flags & IFF_UP)) {
+            continue;
+        }
+
+        if (!(item->ifa_flags & IFF_BROADCAST)) {
+            continue;
+        }
+
+        if (item->ifa_flags & IFF_LOOPBACK) {
+            continue;
+        }
+
+        memset(&broadcast_address, 0, sizeof(broadcast_address));
+        memcpy(&broadcast_address, item->ifa_broadaddr, sizeof(broadcast_address));
+        broadcast_address.sin_port = htons(DISCOVERY_PORT);
+
+        if (sendto(socket_fd, message, strlen(message), 0,
+                   (struct sockaddr *)&broadcast_address,
+                   sizeof(broadcast_address)) >= 0) {
+            sent_count++;
+            log_message("INFO", "Discovery broadcast sent to interface: %s",
+                        item->ifa_name);
+        }
+    }
+
+    freeifaddrs(interfaces);
+
+    if (sent_count == 0) {
+        memset(&fallback_address, 0, sizeof(fallback_address));
+        fallback_address.sin_family = AF_INET;
+        fallback_address.sin_port = htons(DISCOVERY_PORT);
+        fallback_address.sin_addr.s_addr = inet_addr("255.255.255.255");
+
+        if (sendto(socket_fd, message, strlen(message), 0,
+                   (struct sockaddr *)&fallback_address,
+                   sizeof(fallback_address)) >= 0) {
+            sent_count++;
+            log_message("INFO", "Discovery broadcast sent to fallback address");
+        }
+    }
+
+    return sent_count;
+}
+
 int discover_peers(const char *current_node_name, int current_port, Peer peers[], int max_peers) {
     int socket_fd;
     int option;
     int peer_count;
 
-    struct sockaddr_in broadcast_address;
     struct sockaddr_in sender_address;
     socklen_t sender_length;
     struct timeval timeout;
@@ -396,37 +464,37 @@ int discover_peers(const char *current_node_name, int current_port, Peer peers[]
     }
 
     option = 1;
+
     setsockopt(socket_fd, SOL_SOCKET, SO_BROADCAST, &option, sizeof(option));
+    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
 
     timeout.tv_sec = DISCOVERY_TIMEOUT_SECONDS;
     timeout.tv_usec = 0;
-    setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    memset(&broadcast_address, 0, sizeof(broadcast_address));
-    broadcast_address.sin_family = AF_INET;
-    broadcast_address.sin_port = htons(DISCOVERY_PORT);
-    broadcast_address.sin_addr.s_addr = inet_addr(DISCOVERY_BROADCAST_IP);
+    setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
     snprintf(message, sizeof(message), "DISCOVER_P2P %s %d\n",
              current_node_name, current_port);
 
-    if (sendto(socket_fd, message, strlen(message), 0,
-               (struct sockaddr *)&broadcast_address, sizeof(broadcast_address)) < 0) {
-        log_message("ERROR", "Cannot send discovery broadcast");
+    if (send_discovery_to_all_interfaces(socket_fd, message) <= 0) {
+        log_message("ERROR", "Cannot send discovery broadcast to interfaces");
         close(socket_fd);
         return 0;
     }
 
     log_message("INFO", "Discovery broadcast sent");
+
     peer_count = 0;
 
     while (peer_count < max_peers) {
         memset(buffer, 0, sizeof(buffer));
         memset(&sender_address, 0, sizeof(sender_address));
+
         sender_length = sizeof(sender_address);
 
         received = recvfrom(socket_fd, buffer, sizeof(buffer) - 1, 0,
-                            (struct sockaddr *)&sender_address, &sender_length);
+                            (struct sockaddr *)&sender_address,
+                            &sender_length);
 
         if (received <= 0) {
             break;
@@ -436,6 +504,7 @@ int discover_peers(const char *current_node_name, int current_port, Peer peers[]
 
         memset(command, 0, sizeof(command));
         memset(peer_name, 0, sizeof(peer_name));
+
         peer_port = 0;
 
         if (sscanf(buffer, "%63s %31s %d", command, peer_name, &peer_port) != 3) {
@@ -469,6 +538,7 @@ int discover_peers(const char *current_node_name, int current_port, Peer peers[]
     }
 
     close(socket_fd);
+
     return peer_count;
 }
 
