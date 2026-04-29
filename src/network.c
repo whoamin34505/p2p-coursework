@@ -354,18 +354,18 @@ void *discovery_listener_thread(void *arg) {
             continue;
         }
 
-        //
+        
         if (strcmp(command, "CHECK_NAME") == 0) {
-    if (strcmp(sender_name, discovery_args->node_name) == 0) {
-        snprintf(response, sizeof(response), "NAME_EXISTS %s %d\n",
-                 discovery_args->node_name, discovery_args->tcp_port);
+            if (strcmp(sender_name, discovery_args->node_name) == 0) {
+            snprintf(response, sizeof(response), "NAME_EXISTS %s %d\n",
+                    discovery_args->node_name, discovery_args->tcp_port);
 
-        sendto(socket_fd, response, strlen(response), 0,
-               (struct sockaddr *)&sender_address, sender_length);
+            sendto(socket_fd, response, strlen(response), 0,
+                (struct sockaddr *)&sender_address, sender_length);
 
-        log_message("INFO", "Node name check response sent: %s",
-                    discovery_args->node_name);
-    }
+            log_message("INFO", "Node name check response sent: %s",
+                        discovery_args->node_name);
+        }
 
     continue;
 }

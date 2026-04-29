@@ -135,7 +135,8 @@ if (node_name_exists_in_network(config.node_name) == 1) {
     print_help();
 
     while (1) {
-        printf("> ");
+        printf("%s> ", config.node_name);
+        fflush(stdout);
 
         if (fgets(command, sizeof(command), stdin) == NULL) {
             break;
