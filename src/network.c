@@ -226,8 +226,9 @@ static int create_server_socket(int port) {
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
+        printf("ERROR: Socket creation failed\n");
         log_message("ERROR", "socket failed");
-        return -1;
+        exit(1);
     }
 
     option = 1;
@@ -239,15 +240,17 @@ static int create_server_socket(int port) {
     address.sin_port = htons((unsigned short)port);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        printf("ERROR: Port %d is already in use. Cannot start node.\n", port);
         log_message("ERROR", "bind failed");
         close(server_fd);
-        return -1;
+        exit(1);
     }
 
     if (listen(server_fd, 10) < 0) {
+        printf("ERROR: Listen failed on port %d\n", port);
         log_message("ERROR", "listen failed");
         close(server_fd);
-        return -1;
+        exit(1);
     }
 
     return server_fd;
