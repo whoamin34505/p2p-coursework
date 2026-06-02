@@ -51,6 +51,5 @@ exit
 ```
 ## Before use:
 ```bash
-sudo apt update
-sudo apt install build-essential make gcc libssl-dev
+brew install openssl
 ```
