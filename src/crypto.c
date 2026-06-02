@@ -6,8 +6,8 @@
 
 #define CRYPTO_BUFFER_SIZE 4096
 
-static const unsigned char KEY[32] = "0123456789abcdef0123456789abcdef";
-static const unsigned char IV[16] = "abcdef9876543210";
+static const unsigned char KEY[33] = "0123456789abcdef0123456789abcdef";
+static const unsigned char IV[17] = "abcdef9876543210";
 
 static int process_file(const char *input_path, const char *output_path, int encrypt_mode) {
     FILE *input_file;
