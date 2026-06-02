@@ -322,6 +322,10 @@ void *discovery_listener_thread(void *arg) {
     option = 1;
     setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option));
 
+    #ifdef SO_REUSEPORT
+    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &option, sizeof(option));
+    #endif
+
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
